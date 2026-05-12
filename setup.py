@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="cbpi4-InputControl",
-    version="0.0.5",
+    version="0.0.6",
     description="CraftBeerPi 4 plugin for input control (physical buttons, etc.) → actor on/off/toggle",
     author="daGrumpf",
     author_email="",

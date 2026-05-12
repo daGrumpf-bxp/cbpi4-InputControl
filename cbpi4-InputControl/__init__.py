@@ -62,8 +62,70 @@ except ImportError:
 
 DEFAULT_CONFIG_JSON = "[]"
 CONFIG_KEY = "input_control_config"
-GPIO_BLACKLIST_HARDCODED = {0, 1, 2, 3, 4}
-_PLUGIN_VERSION = "0.0.5"
+_PLUGIN_VERSION = "0.0.6"
+
+# GPIO 0 et 1 sont TOUJOURS bloqués (EEPROM HAT, ID_SD/ID_SC). Pas négociable.
+# Le reste (I2C, 1-Wire, SPI, UART) est détecté dynamiquement au boot.
+GPIO_ALWAYS_BLACKLISTED = {0, 1}
+
+# Mapping bus système → pins BCM concernées
+# (utilisé pour construire la blacklist dynamique selon ce qui est activé)
+_BUS_PINS = {
+    "i2c": {2, 3},      # GPIO 2 (SDA), GPIO 3 (SCL)
+    "1wire": {4},       # GPIO 4 par défaut Pi (peut varier via dtoverlay)
+    "spi": {7, 8, 9, 10, 11},  # CE1, CE0, MISO, MOSI, SCLK
+    "uart": {14, 15},   # TXD, RXD
+}
+
+
+def _detect_active_buses() -> dict:
+    """
+    Détecte au boot quels bus système sont actifs sur ce Pi.
+
+    Méthode : on vérifie l'existence des device files que le kernel crée
+    quand le bus est activé via dtparam/dtoverlay. C'est plus fiable que de
+    parser /boot/firmware/config.txt (chemin variable, edge cases).
+
+    Retourne un dict { "i2c": bool, "1wire": bool, "spi": bool, "uart": bool }
+    """
+    import os
+    import glob
+
+    i2c_on = any(os.path.exists(f"/dev/i2c-{n}") for n in (0, 1, 2, 3))
+
+    onewire_on = (
+        os.path.exists("/sys/bus/w1/devices")
+        or os.path.exists("/sys/module/w1_gpio")
+    )
+
+    # spidev0.0 / spidev0.1 sont créés quand SPI est armé
+    spi_on = bool(glob.glob("/dev/spidev*"))
+
+    # /dev/serial0 (lien) est créé si enable_uart=1 ; /dev/ttyAMA0 sinon
+    uart_on = (
+        os.path.exists("/dev/serial0")
+        or os.path.exists("/dev/ttyAMA0")
+        or os.path.exists("/dev/ttyS0")
+    )
+
+    return {
+        "i2c": i2c_on,
+        "1wire": onewire_on,
+        "spi": spi_on,
+        "uart": uart_on,
+    }
+
+
+def _build_dynamic_blacklist(active_buses: dict) -> set:
+    """
+    Construit la blacklist effective : GPIO toujours bloqués
+    + ceux des bus système actifs.
+    """
+    bl = set(GPIO_ALWAYS_BLACKLISTED)
+    for bus, on in active_buses.items():
+        if on:
+            bl |= _BUS_PINS.get(bus, set())
+    return bl
 
 
 def _get_local_ip() -> str:
@@ -344,19 +406,31 @@ async function loadActors() {
   );
 }
 
+let blacklistReasons = {};  // {"4": ["1wire"], "2": ["i2c"], ...}
+let activeBuses = {};
+
 async function loadStatus() {
   const s = await fetchJSON('/inputcontrol/status');
   blacklist = new Set(s.blacklist || []);
+  blacklistReasons = s.blacklist_reasons || {};
+  activeBuses = s.active_buses || {};
   (s.busy_output_gpios || []).forEach(g => busyGPIOs.add(g));
 
   updateStatusDisplay(s);
 
-  const blPart = [...blacklist].sort((a,b)=>a-b).join(', ');
+  // Bandeau d'info enrichi : GPIO bloqués avec raison, bus actifs, etc.
+  const blParts = [...blacklist].sort((a,b)=>a-b).map(g => {
+    const reasons = blacklistReasons[String(g)] || [];
+    return reasons.length ? `${g}(${reasons.join('+')})` : String(g);
+  });
   const busyPart = [...busyGPIOs].sort((a,b)=>a-b).join(', ') || 'aucun';
+  const busesPart = Object.entries(activeBuses)
+    .map(([n, on]) => `${n}=${on ? '✓' : '✗'}`).join(' ');
   document.getElementById('bl-info').innerHTML =
-    `<b>GPIO système (réservés)</b> : ${blPart} &nbsp; · &nbsp; ` +
-    `<b>GPIO utilisés par actors output</b> : ${busyPart} &nbsp; · &nbsp; ` +
-    `<b>Backend GPIO</b> : ${s.gpio_backend || '?'}`;
+    `<b>GPIO bloqués</b> : ${blParts.join(', ')} &nbsp; · &nbsp; ` +
+    `<b>Actors output</b> : ${busyPart} &nbsp; · &nbsp; ` +
+    `<b>Bus système</b> : ${busesPart} &nbsp; · &nbsp; ` +
+    `<b>Backend</b> : ${s.gpio_backend || '?'}`;
 }
 
 function updateStatusDisplay(s) {
@@ -410,7 +484,11 @@ function addRow(b) {
   allGPIOs.forEach(g => {
     let label = `GPIO ${g}`;
     let disabled = false;
-    if (blacklist.has(g)) { label += ' (système)'; disabled = true; }
+    if (blacklist.has(g)) {
+      const reasons = blacklistReasons[String(g)] || [];
+      label += reasons.length ? ` (${reasons.join('+')})` : ' (système)';
+      disabled = true;
+    }
     else if (busyGPIOs.has(g)) { label += ' (utilisé en sortie)'; disabled = true; }
     const opt = new Option(label, g);
     if (disabled) opt.disabled = true;
@@ -575,6 +653,11 @@ class InputControl(CBPiExtension):
         self.cbpi = cbpi
         self.sources = []
         self.last_load_errors = []
+        # Détection des bus système actifs au boot (figée pour la durée de
+        # vie du plugin ; un changement de config.txt → reboot CBPi pour
+        # re-détecter, c'est rare et acceptable).
+        self.active_buses = _detect_active_buses()
+        self.gpio_blacklist = _build_dynamic_blacklist(self.active_buses)
         # Enregistrement officiel CBPi (lit @request_mapping sur les méthodes
         # et monte un sub-app aiohttp à /inputcontrol/*). Doit être fait
         # synchrone dans __init__, avant le freeze du router.
@@ -583,11 +666,18 @@ class InputControl(CBPiExtension):
 
     async def run(self):
         ui_url = f"http://{_get_local_ip()}:8000/inputcontrol/ui"
+        bus_summary = ", ".join(
+            f"{name}={'on' if on else 'off'}"
+            for name, on in self.active_buses.items()
+        )
         logger.warning("=" * 60)
         logger.warning("🎛 cbpi4-InputControl V%s — coucou je suis bien là", _PLUGIN_VERSION)
-        logger.warning("    Backend GPIO : %s  (running on Pi: %s)",
+        logger.warning("    Backend GPIO  : %s  (running on Pi: %s)",
                        _GPIO_BACKEND, _ON_PI)
-        logger.warning("    UI de config : %s", ui_url)
+        logger.warning("    Bus système   : %s", bus_summary)
+        logger.warning("    GPIO bloqués  : %s",
+                       sorted(self.gpio_blacklist))
+        logger.warning("    UI de config  : %s", ui_url)
         logger.warning("=" * 60)
         await self._ensure_config_exists(ui_url)
         await self.reload_from_config()
@@ -701,8 +791,14 @@ class InputControl(CBPiExtension):
             pin = src.get("pin")
             if not isinstance(pin, int):
                 raise ValueError("source.pin doit être un entier")
-            if pin in GPIO_BLACKLIST_HARDCODED:
-                raise ValueError(f"GPIO {pin} système")
+            if pin in self.gpio_blacklist:
+                # Donne plus d'info : pour quel bus est-il bloqué ?
+                bus_reason = []
+                for bus, pins in _BUS_PINS.items():
+                    if pin in pins and self.active_buses.get(bus):
+                        bus_reason.append(bus)
+                why = f"bus {','.join(bus_reason)}" if bus_reason else "système"
+                raise ValueError(f"GPIO {pin} réservé ({why})")
             if pin in busy_output:
                 raise ValueError(f"GPIO {pin} déjà utilisé par un actor output")
             if pin in used_pins:
@@ -786,9 +882,24 @@ class InputControl(CBPiExtension):
             "last_load_errors": self.last_load_errors,
             "running_on_pi": _ON_PI,
             "gpio_backend": _GPIO_BACKEND,
-            "blacklist": sorted(GPIO_BLACKLIST_HARDCODED),
+            "active_buses": self.active_buses,
+            "blacklist": sorted(self.gpio_blacklist),
+            "blacklist_reasons": self._blacklist_with_reasons(),
             "busy_output_gpios": sorted(self._busy_output_gpios()),
         })
+
+    def _blacklist_with_reasons(self):
+        """Pour l'UI : pour chaque pin bloquée, dit pourquoi."""
+        reasons = {}
+        for pin in sorted(self.gpio_blacklist):
+            why = []
+            if pin in GPIO_ALWAYS_BLACKLISTED:
+                why.append("eeprom-hat")
+            for bus, pins in _BUS_PINS.items():
+                if pin in pins and self.active_buses.get(bus):
+                    why.append(bus)
+            reasons[str(pin)] = why
+        return reasons
 
     @request_mapping(path="/config", method="GET", auth_required=False)
     async def http_get_config(self, request):

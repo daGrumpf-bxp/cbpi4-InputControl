@@ -126,4 +126,3 @@ d'action sur les actors.
 ## Licence
 
 GPL-3.0
->>>>>>> c4f75b0 (Initial commit — cbpi4-InputControl v0.0.5)
