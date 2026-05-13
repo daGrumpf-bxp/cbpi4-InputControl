@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="cbpi4-InputControl",
-    version="0.0.6",
+    version="0.0.13",
     description="CraftBeerPi 4 plugin for input control (physical buttons, etc.) → actor on/off/toggle",
     author="daGrumpf",
     author_email="",
@@ -17,5 +17,6 @@ setup(
     install_requires=[
         "gpiozero>=2.0",
         "lgpio>=0.2.0",
+        "smbus2>=0.4.0",  # pour la source PCF8574
     ],
 )

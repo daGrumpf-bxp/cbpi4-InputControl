@@ -62,7 +62,7 @@ except ImportError:
 
 DEFAULT_CONFIG_JSON = "[]"
 CONFIG_KEY = "input_control_config"
-_PLUGIN_VERSION = "0.0.6"
+_PLUGIN_VERSION = "0.0.13"
 
 # GPIO 0 et 1 sont TOUJOURS bloqués (EEPROM HAT, ID_SD/ID_SC). Pas négociable.
 # Le reste (I2C, 1-Wire, SPI, UART) est détecté dynamiquement au boot.
@@ -171,8 +171,18 @@ class InputSource:
 class GPIOInputSource(InputSource):
     """
     Source bouton via gpiozero.Button. Compatible Pi 1 → Pi 5, Bullseye et
-    Bookworm. gpiozero gère l'anti-rebond et le pull-up/down nativement,
-    et appelle `when_pressed` / `when_released` dans son thread interne.
+    Bookworm.
+
+    Notes sur le debounce (V0.0.7+) :
+    - On NE passe PAS bounce_time à gpiozero : le backend lgpio implémente le
+      debounce de manière "pré-trigger" (le signal doit rester stable pendant
+      tout le bounce_time AVANT que l'event soit émis). Pour un click humain
+      court, ça donne l'impression que rien ne se passe.
+    - À la place, on déclenche IMMÉDIATEMENT sur le premier edge, puis on
+      ignore tous les events suivants pendant `debounce_ms` millisecondes.
+      C'est le comportement intuitif type RPi.GPIO `bouncetime`.
+    - Le debounce est lu au niveau `button.debounce_ms` (nouveau, V0.0.7+),
+      avec fallback `source.debounce_ms` pour rétro-compat.
     """
 
     def __init__(self, button_config, on_press_callback, loop):
@@ -181,20 +191,24 @@ class GPIOInputSource(InputSource):
         self.pin = int(src.get("pin"))
         self.pull = src.get("pull", "up").lower()
         self.edge = src.get("edge", "falling").lower()
-        self.debounce_ms = int(src.get("debounce_ms", 300))
+        # V0.0.7 : debounce remonte au niveau bouton, fallback source.debounce_ms
+        self.debounce_ms = int(
+            button_config.get("debounce_ms",
+                              src.get("debounce_ms", 300))
+        )
         self._loop = loop
         self._button: Optional["Button"] = None
         self._armed = False
         self._press_count = 0
+        self._ignored_count = 0    # nombre d'events filtrés par debounce
         self._last_press_ts: Optional[float] = None
+        self._last_event_monotonic: float = 0.0  # pour le filtre debounce
 
     async def start(self, loop):
         if Button is None:
             raise RuntimeError("gpiozero indisponible — impossible d'armer GPIO%d" % self.pin)
 
         # Mapping pull
-        # gpiozero : pull_up=True/False/None
-        # None nécessite active_state explicite (rare ; pull externe)
         if self.pull == "up":
             pull_up = True
             active_state = None
@@ -203,28 +217,19 @@ class GPIOInputSource(InputSource):
             active_state = None
         else:  # "none"
             pull_up = None
-            active_state = True  # par défaut on considère 1 = "pressé"
+            active_state = True
 
-        # gpiozero bounce_time est en SECONDES (None = pas d'anti-rebond)
-        bounce_s = (self.debounce_ms / 1000.0) if self.debounce_ms > 0 else None
-
+        # IMPORTANT : on passe bounce_time=None à gpiozero pour avoir une
+        # détection IMMÉDIATE. Le debounce est fait dans _on_event en Python.
         try:
             self._button = Button(
                 self.pin,
                 pull_up=pull_up,
                 active_state=active_state,
-                bounce_time=bounce_s,
+                bounce_time=None,
             )
 
-            # Mapping edge → quel événement on écoute
-            # En logique gpiozero :
-            #  - pull_up=True  : pressed quand pin → LOW  (falling edge)
-            #  - pull_up=False : pressed quand pin → HIGH (rising edge)
-            # Donc "falling" = when_pressed si pull_up, when_released si pull_down
-            # Pour rester intuitif, on mappe directement :
             if self.edge == "falling":
-                # front descendant = bouton qui tire à GND → on attache à pressed
-                # (avec pull_up) ou à released (avec pull_down)
                 if self.pull == "up":
                     self._button.when_pressed = self._on_event
                 else:
@@ -240,7 +245,7 @@ class GPIOInputSource(InputSource):
 
             self._armed = True
             logger.info(
-                "[%s] GPIO%d armé (gpiozero) pull=%s edge=%s deb=%dms",
+                "[%s] GPIO%d armé (gpiozero) pull=%s edge=%s deb=%dms (post-trigger)",
                 self.name, self.pin, self.pull, self.edge, self.debounce_ms,
             )
         except Exception as e:
@@ -257,8 +262,6 @@ class GPIOInputSource(InputSource):
     async def stop(self):
         try:
             if self._button is not None:
-                # close() détache les callbacks et libère la pin proprement.
-                # On ne set PAS when_pressed=None (gpiozero émet un warning).
                 self._button.close()
                 logger.info("[%s] GPIO%d désarmé", self.name, self.pin)
         except Exception as e:
@@ -268,7 +271,20 @@ class GPIOInputSource(InputSource):
             self._armed = False
 
     def _on_event(self):
-        """Callback appelé par gpiozero dans son thread interne."""
+        """
+        Callback appelé par gpiozero dans son thread interne.
+        Applique le debounce "post-trigger" : on déclenche immédiatement
+        au premier event, puis on ignore tout pendant debounce_ms.
+        """
+        import time as _t
+        now = _t.monotonic()
+        elapsed_ms = (now - self._last_event_monotonic) * 1000.0
+        if self._last_event_monotonic > 0 and elapsed_ms < self.debounce_ms:
+            self._ignored_count += 1
+            logger.debug("[%s] GPIO%d rebond ignoré (%.0fms < %dms)",
+                         self.name, self.pin, elapsed_ms, self.debounce_ms)
+            return
+        self._last_event_monotonic = now
         self._press_count += 1
         self._last_press_ts = time.time()
         logger.debug("[%s] GPIO%d event (count=%d)",
@@ -282,7 +298,9 @@ class GPIOInputSource(InputSource):
         return {
             "name": self.name, "type": "gpio", "pin": self.pin,
             "pull": self.pull, "edge": self.edge, "debounce_ms": self.debounce_ms,
-            "armed": self._armed, "press_count": self._press_count,
+            "armed": self._armed,
+            "press_count": self._press_count,
+            "ignored_count": self._ignored_count,
             "last_press_ts": self._last_press_ts,
             "backend": _GPIO_BACKEND,
         }
@@ -291,16 +309,276 @@ class GPIOInputSource(InputSource):
 SOURCE_CLASSES = {"gpio": GPIOInputSource}
 
 
-def build_source(button_config, on_press_callback, loop):
+def build_source(button_config, on_press_callback, loop, mux_registry=None):
     src_type = button_config.get("source", {}).get("type")
     cls = SOURCE_CLASSES.get(src_type)
     if cls is None:
         return None
     try:
+        # PCF8574InputSource a besoin du registry pour partager les muxers
+        if src_type == "pcf8574":
+            return cls(button_config, on_press_callback, loop, mux_registry)
         return cls(button_config, on_press_callback, loop)
     except Exception as e:
         logger.error("Build source %s KO: %s", src_type, e)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# PCF8574 — Multiplexer partagé + InputSource léger par bouton
+# --------------------------------------------------------------------------- #
+class PCF8574Multiplexer:
+    """
+    Service partagé entre tous les boutons attachés au même PCF8574.
+
+    Responsabilités :
+    - Tient une connexion I2C ouverte vers le chip (smbus2)
+    - Arme le GPIO INT du Pi (via gpiozero.Button, falling edge)
+    - Au déclenchement INT : lit l'octet I2C, diff avec l'état précédent,
+      dispatch vers les callbacks des pins concernées
+    - Au boot : met toutes les pins du PCF en mode INPUT (= écrit 0xFF, ce
+      qui active le quasi-pull-up interne sur chaque pin)
+
+    Note debounce : le multiplexer N'APPLIQUE PAS de debounce. Chaque
+    PCF8574InputSource applique son propre debounce post-trigger côté
+    Python sur son pin, ce qui est cohérent avec GPIOInputSource.
+    Le GPIO INT est armé SANS debounce non plus (le PCF8574 déclenche INT
+    une fois par état stable, pas par rebond mécanique).
+    """
+
+    # Adresses I2C valides pour PCF8574 (0x20-0x27) et PCF8574A (0x38-0x3F)
+    VALID_ADDRESSES = set(range(0x20, 0x28)) | set(range(0x38, 0x40))
+
+    def __init__(self, address: int, int_gpio: int, i2c_bus: int = 1):
+        self.address = address
+        self.int_gpio = int_gpio
+        self.i2c_bus = i2c_bus
+        self._smbus = None
+        self._int_button = None
+        self._last_state: int = 0xFF  # Au repos : tout est HIGH (pull-up)
+        # callbacks par pin : { pin_index (0-7) : [(button_config, on_press_cb), ...] }
+        self._pin_callbacks: dict = {}
+        self._loop = None
+        self._read_count = 0
+        self._last_read_ts = None
+        self._armed = False
+
+    def register_pin(self, pin: int, button_config: dict, on_press_cb):
+        """Enregistre un bouton sur une pin P0-P7. À appeler avant start()."""
+        if not (0 <= pin <= 7):
+            raise ValueError(f"PCF8574 pin doit être 0-7, reçu {pin}")
+        self._pin_callbacks.setdefault(pin, []).append((button_config, on_press_cb))
+
+    async def start(self, loop):
+        """Ouvre I2C, met les pins en input, arme l'INT GPIO."""
+        self._loop = loop
+        try:
+            import smbus2
+        except ImportError:
+            raise RuntimeError(
+                "smbus2 manquant pour PCF8574 — "
+                "sudo apt install python3-smbus2"
+            )
+        # Ouvre le bus I2C
+        try:
+            self._smbus = smbus2.SMBus(self.i2c_bus)
+        except Exception as e:
+            raise RuntimeError(
+                f"Impossible d'ouvrir /dev/i2c-{self.i2c_bus} : {e}"
+            )
+        # Met toutes les pins en mode "input" en écrivant 0xFF
+        # (quasi-bidirectional : un 1 écrit active le pull-up interne et la
+        # pin devient une entrée, prête à être tirée à GND par le bouton)
+        try:
+            self._smbus.write_byte(self.address, 0xFF)
+            # Lecture initiale pour synchroniser _last_state
+            self._last_state = self._smbus.read_byte(self.address)
+        except Exception as e:
+            raise RuntimeError(
+                f"PCF8574 @0x{self.address:02x} ne répond pas sur /dev/i2c-{self.i2c_bus} : {e}"
+            )
+        # Arme le GPIO INT — falling edge, pull-up interne du Pi, SANS debounce
+        # car le PCF8574 latch déjà l'INT (pas de rebond côté chip).
+        if Button is None:
+            raise RuntimeError("gpiozero indisponible")
+        self._int_button = Button(
+            self.int_gpio,
+            pull_up=True,
+            active_state=None,
+            bounce_time=None,
+        )
+        self._int_button.when_pressed = self._on_int
+        self._armed = True
+        logger.info(
+            "PCF8574 mux armé : @0x%02x sur /dev/i2c-%d, INT=GPIO%d, %d bouton(s)",
+            self.address, self.i2c_bus, self.int_gpio,
+            sum(len(v) for v in self._pin_callbacks.values()),
+        )
+
+    async def stop(self):
+        if self._int_button is not None:
+            try:
+                self._int_button.close()
+            except Exception as e:
+                logger.warning("PCF8574 INT close KO: %s", e)
+            self._int_button = None
+        if self._smbus is not None:
+            try:
+                self._smbus.close()
+            except Exception as e:
+                logger.warning("PCF8574 I2C close KO: %s", e)
+            self._smbus = None
+        self._armed = False
+        logger.info("PCF8574 mux désarmé : @0x%02x", self.address)
+
+    def _on_int(self):
+        """
+        Callback de l'INT GPIO (thread gpiozero). Lit I2C, diff, dispatch.
+        Tourne dans le thread de gpiozero — toute action sur les callbacks
+        des boutons doit être schedulée sur le loop asyncio.
+        """
+        import time as _t
+        try:
+            current = self._smbus.read_byte(self.address)
+        except Exception as e:
+            logger.error("PCF8574 @0x%02x read KO: %s", self.address, e)
+            return
+        self._read_count += 1
+        self._last_read_ts = _t.time()
+        # XOR pour trouver les bits qui ont changé
+        changed = self._last_state ^ current
+        # Pour chaque bit qui a basculé de 1 → 0 (= front descendant = pression)
+        for pin in range(8):
+            bit_mask = 1 << pin
+            if changed & bit_mask:
+                # Le bit a changé. Front descendant si current bit == 0
+                bit_now = (current >> pin) & 1
+                if bit_now == 0:
+                    # Pression détectée sur ce pin
+                    for (btn_cfg, cb) in self._pin_callbacks.get(pin, []):
+                        try:
+                            asyncio.run_coroutine_threadsafe(cb(btn_cfg, pin), self._loop)
+                        except Exception as e:
+                            logger.error("PCF8574 dispatch P%d KO: %s", pin, e)
+        self._last_state = current
+
+    def describe(self):
+        return {
+            "type": "pcf8574_mux",
+            "address": f"0x{self.address:02x}",
+            "i2c_bus": self.i2c_bus,
+            "int_gpio": self.int_gpio,
+            "armed": self._armed,
+            "registered_pins": sorted(self._pin_callbacks.keys()),
+            "last_state_hex": f"0x{self._last_state:02x}",
+            "read_count": self._read_count,
+            "last_read_ts": self._last_read_ts,
+        }
+
+
+class PCF8574InputSource(InputSource):
+    """
+    Source bouton via une pin P0-P7 d'un PCF8574, déclenchée par INT.
+
+    Cette classe est légère : elle s'enregistre auprès d'un PCF8574Multiplexer
+    partagé (un par couple address+int_gpio). Le multiplexer fait tout le
+    boulot I2C ; cette classe gère uniquement l'identité du bouton et le
+    debounce post-trigger Python.
+
+    Config attendue :
+        {
+            "source": {
+                "type": "pcf8574",
+                "address": "0x21",       (ou int 0x21)
+                "int_gpio": 24,           (GPIO BCM du Pi câblé sur INT)
+                "pin": 3,                 (P0-P7 sur le chip)
+                "i2c_bus": 1              (optionnel, défaut /dev/i2c-1)
+            },
+            "debounce_ms": 300,
+            ...
+        }
+    """
+
+    def __init__(self, button_config, on_press_callback, loop, mux_registry):
+        super().__init__(button_config, on_press_callback)
+        src = button_config.get("source", {})
+        # Parse address (accepte "0x21", 33, "33")
+        addr_raw = src.get("address")
+        if isinstance(addr_raw, str):
+            self.address = int(addr_raw, 16) if addr_raw.startswith("0x") else int(addr_raw)
+        else:
+            self.address = int(addr_raw)
+        self.int_gpio = int(src.get("int_gpio"))
+        self.pin = int(src.get("pin"))
+        self.i2c_bus = int(src.get("i2c_bus", 1))
+        self.debounce_ms = int(
+            button_config.get("debounce_ms", src.get("debounce_ms", 300))
+        )
+        self._loop = loop
+        self._mux_registry = mux_registry
+        self._mux: Optional[PCF8574Multiplexer] = None
+        self._armed = False
+        self._press_count = 0
+        self._ignored_count = 0
+        self._last_press_ts: Optional[float] = None
+        self._last_event_monotonic: float = 0.0
+
+    async def start(self, loop):
+        # Find or create the multiplexer for (address, int_gpio, i2c_bus)
+        key = (self.address, self.int_gpio, self.i2c_bus)
+        mux = self._mux_registry.get(key)
+        if mux is None:
+            mux = PCF8574Multiplexer(self.address, self.int_gpio, self.i2c_bus)
+            self._mux_registry[key] = mux
+        self._mux = mux
+        mux.register_pin(self.pin, self.config, self._dispatch_press)
+        # mux.start() est appelé par le plugin globalement après tous les register_pin
+        self._armed = True
+        logger.info(
+            "[%s] PCF8574 input @0x%02x P%d (INT=GPIO%d, deb=%dms)",
+            self.name, self.address, self.pin, self.int_gpio, self.debounce_ms,
+        )
+
+    async def stop(self):
+        # Le démontage du mux est géré globalement par le plugin
+        self._mux = None
+        self._armed = False
+
+    async def _dispatch_press(self, button_config, pin):
+        """
+        Coroutine appelée par le mux quand sa pin a vu un front descendant.
+        Applique le debounce post-trigger et schedule le callback utilisateur.
+        """
+        import time as _t
+        now = _t.monotonic()
+        elapsed_ms = (now - self._last_event_monotonic) * 1000.0
+        if self._last_event_monotonic > 0 and elapsed_ms < self.debounce_ms:
+            self._ignored_count += 1
+            logger.debug("[%s] PCF8574 P%d rebond ignoré (%.0fms)",
+                         self.name, pin, elapsed_ms)
+            return
+        self._last_event_monotonic = now
+        self._press_count += 1
+        self._last_press_ts = _t.time()
+        await self.on_press(button_config)
+
+    def describe(self):
+        return {
+            "name": self.name, "type": "pcf8574",
+            "address": f"0x{self.address:02x}",
+            "int_gpio": self.int_gpio,
+            "pin": self.pin,
+            "i2c_bus": self.i2c_bus,
+            "debounce_ms": self.debounce_ms,
+            "armed": self._armed,
+            "press_count": self._press_count,
+            "ignored_count": self._ignored_count,
+            "last_press_ts": self._last_press_ts,
+        }
+
+
+# Ajoute la nouvelle source au factory
+SOURCE_CLASSES["pcf8574"] = PCF8574InputSource
 
 
 # --------------------------------------------------------------------------- #
@@ -316,7 +594,7 @@ UI_HTML = r"""<!DOCTYPE html>
          margin: 1em auto; padding: 0 1em; color: #222; }
   h1 { margin-bottom: 0.2em; }
   .subtitle { color: #666; margin-bottom: 1.5em; }
-  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; table-layout: auto; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left;
            vertical-align: middle; }
   th { background: #f5f5f5; font-weight: 600; }
@@ -324,6 +602,17 @@ UI_HTML = r"""<!DOCTYPE html>
     width: 100%; padding: 4px 6px; box-sizing: border-box;
     border: 1px solid #ccc; border-radius: 3px; font-size: 14px;
   }
+  /* Largeurs minimales par colonne pour éviter la troncature des selects */
+  #buttons th:nth-child(1), #buttons td:nth-child(1) { min-width: 120px; }  /* Nom */
+  #buttons th:nth-child(2), #buttons td:nth-child(2) { min-width: 95px; }   /* Type */
+  #buttons th:nth-child(3), #buttons td:nth-child(3) { min-width: 110px; }  /* GPIO/PCF */
+  #buttons th:nth-child(4), #buttons td:nth-child(4) { min-width: 105px; }  /* Pull/INT */
+  #buttons th:nth-child(5), #buttons td:nth-child(5) { min-width: 80px; }   /* Edge */
+  #buttons th:nth-child(6), #buttons td:nth-child(6) { min-width: 85px; }   /* Debounce */
+  #buttons th:nth-child(7), #buttons td:nth-child(7) { min-width: 200px; }  /* Actor */
+  #buttons th:nth-child(8), #buttons td:nth-child(8) { min-width: 85px; }   /* Action */
+  #buttons th:nth-child(9), #buttons td:nth-child(9) { width: 50px; text-align: center; }
+  #buttons th:nth-child(10), #buttons td:nth-child(10) { width: 40px; }
   button { padding: 6px 12px; font-size: 14px; cursor: pointer;
            border: 1px solid #888; background: #fafafa; border-radius: 3px; }
   button.primary { background: #2a7; color: white; border-color: #285; }
@@ -352,7 +641,8 @@ UI_HTML = r"""<!DOCTYPE html>
   <thead>
     <tr>
       <th>Nom</th>
-      <th>GPIO</th>
+      <th>Type</th>
+      <th>GPIO / PCF</th>
       <th>Pull</th>
       <th>Edge</th>
       <th>Debounce&nbsp;ms</th>
@@ -444,7 +734,8 @@ function updateStatusDisplay(s) {
       const ts = src.last_press_ts
         ? new Date(src.last_press_ts * 1000).toLocaleTimeString()
         : 'jamais';
-      lines.push(`  • ${src.name}  pin=${src.pin}  armé=${src.armed}  presses=${src.press_count}  dernière=${ts}`);
+      const ign = (src.ignored_count != null) ? `  ignorés=${src.ignored_count}` : '';
+      lines.push(`  • ${src.name}  pin=${src.pin}  armé=${src.armed}  presses=${src.press_count}${ign}  dernière=${ts}`);
     });
   }
   if (s.last_load_errors && s.last_load_errors.length) {
@@ -465,60 +756,157 @@ async function loadConfig() {
 function addRow(b) {
   b = b || {
     name: '',
-    source: {type: 'gpio', pin: null, pull: 'up', edge: 'falling', debounce_ms: 300},
+    source: {type: 'gpio', pin: null, pull: 'up', edge: 'falling'},
+    debounce_ms: 300,
     action: {actor: '', do: 'toggle'},
     notify: true,
   };
   const tr = document.createElement('tr');
+  // On stocke le type courant sur la <tr> pour readRows et availability
+  tr.dataset.sourceType = (b.source && b.source.type) || 'gpio';
 
   function td(child) { const t = document.createElement('td'); t.appendChild(child); tr.appendChild(t); return t; }
 
+  // --- Colonne 0 : Nom ---
   const inpName = document.createElement('input');
   inpName.type = 'text';
   inpName.value = b.name || '';
   inpName.placeholder = 'ex: stop_pompe';
+  inpName.addEventListener('input', refreshActorAvailability);
   td(inpName);
 
-  const selGpio = document.createElement('select');
-  selGpio.appendChild(new Option('— choisir —', ''));
-  allGPIOs.forEach(g => {
-    let label = `GPIO ${g}`;
-    let disabled = false;
-    if (blacklist.has(g)) {
-      const reasons = blacklistReasons[String(g)] || [];
-      label += reasons.length ? ` (${reasons.join('+')})` : ' (système)';
-      disabled = true;
+  // --- Colonne 1 : Type de source ---
+  const selType = document.createElement('select');
+  [['gpio', 'GPIO'], ['pcf8574', 'PCF8574']].forEach(([v, label]) => {
+    const o = new Option(label, v);
+    if (tr.dataset.sourceType === v) o.selected = true;
+    selType.appendChild(o);
+  });
+  selType.addEventListener('change', () => {
+    tr.dataset.sourceType = selType.value;
+    renderSourceCells();
+    refreshGPIOAvailability();
+  });
+  td(selType);
+
+  // --- Colonne 2 : Source (variable selon type) ---
+  // Pour GPIO : un <select> GPIO 0-27
+  // Pour PCF8574 : un mini-form avec address + INT GPIO + Pin P0-P7
+  const tdSource = document.createElement('td');
+  tr.appendChild(tdSource);
+
+  // --- Colonne 3 : Pull (utilisée seulement pour GPIO) ---
+  const tdPull = document.createElement('td');
+  tr.appendChild(tdPull);
+
+  // --- Colonne 4 : Edge (utilisée seulement pour GPIO) ---
+  const tdEdge = document.createElement('td');
+  tr.appendChild(tdEdge);
+
+  // Helper : crée le contenu des cellules 2-4 selon le type courant
+  function renderSourceCells() {
+    tdSource.innerHTML = '';
+    tdPull.innerHTML = '';
+    tdEdge.innerHTML = '';
+    if (tr.dataset.sourceType === 'gpio') {
+      // GPIO direct
+      const selGpio = document.createElement('select');
+      selGpio.className = 'gpio-select';
+      selGpio.appendChild(new Option('— choisir —', ''));
+      allGPIOs.forEach(g => {
+        const opt = new Option(`GPIO ${g}`, g);
+        if (b.source && b.source.pin === g) opt.selected = true;
+        selGpio.appendChild(opt);
+      });
+      selGpio.addEventListener('change', refreshGPIOAvailability);
+      tdSource.appendChild(selGpio);
+
+      const selPull = document.createElement('select');
+      ['up','down','none'].forEach(v => {
+        const o = new Option(v, v);
+        if (b.source && b.source.pull === v) o.selected = true;
+        selPull.appendChild(o);
+      });
+      tdPull.appendChild(selPull);
+
+      const selEdge = document.createElement('select');
+      ['falling','rising','both'].forEach(v => {
+        const o = new Option(v, v);
+        if (b.source && b.source.edge === v) o.selected = true;
+        selEdge.appendChild(o);
+      });
+      tdEdge.appendChild(selEdge);
+    } else if (tr.dataset.sourceType === 'pcf8574') {
+      // PCF8574 : addr + INT GPIO + Pin P0-P7 dans la même cellule source
+      // (cellule source contient un wrapper avec 3 sous-inputs)
+      const wrap = document.createElement('div');
+      wrap.style.display = 'flex';
+      wrap.style.gap = '4px';
+      wrap.style.flexDirection = 'column';
+
+      // Address PCF
+      const selAddr = document.createElement('select');
+      selAddr.className = 'pcf-addr';
+      ['0x20','0x21','0x22','0x23','0x24','0x25','0x26','0x27',
+       '0x38','0x39','0x3a','0x3b','0x3c','0x3d','0x3e','0x3f'].forEach(a => {
+        const o = new Option(`@${a}`, a);
+        // pré-sélection (normalisation hex)
+        const cur = (b.source && b.source.address) ? String(b.source.address).toLowerCase() : '';
+        if (cur === a.toLowerCase()) o.selected = true;
+        selAddr.appendChild(o);
+      });
+      selAddr.addEventListener('change', refreshGPIOAvailability);
+      wrap.appendChild(selAddr);
+
+      // Pin P0-P7
+      const selPin = document.createElement('select');
+      selPin.className = 'pcf-pin';
+      for (let i = 0; i < 8; i++) {
+        const o = new Option(`P${i}`, i);
+        if (b.source && b.source.pin === i) o.selected = true;
+        selPin.appendChild(o);
+      }
+      selPin.addEventListener('change', refreshGPIOAvailability);
+      wrap.appendChild(selPin);
+
+      tdSource.appendChild(wrap);
+
+      // Colonne Pull : INT GPIO (réutilisée car libre pour PCF)
+      const selInt = document.createElement('select');
+      selInt.className = 'pcf-int';
+      selInt.appendChild(new Option('INT GPIO ?', ''));
+      allGPIOs.forEach(g => {
+        const opt = new Option(`GPIO ${g}`, g);
+        if (b.source && b.source.int_gpio === g) opt.selected = true;
+        selInt.appendChild(opt);
+      });
+      selInt.addEventListener('change', refreshGPIOAvailability);
+      tdPull.appendChild(selInt);
+
+      // Colonne Edge : libellé "—" (non applicable)
+      const span = document.createElement('span');
+      span.textContent = '—';
+      span.style.color = '#aaa';
+      span.style.display = 'block';
+      span.style.textAlign = 'center';
+      span.title = 'Non applicable : le PCF8574 gère lui-même le front via INT';
+      tdEdge.appendChild(span);
     }
-    else if (busyGPIOs.has(g)) { label += ' (utilisé en sortie)'; disabled = true; }
-    const opt = new Option(label, g);
-    if (disabled) opt.disabled = true;
-    if (b.source && b.source.pin === g) opt.selected = true;
-    selGpio.appendChild(opt);
-  });
-  td(selGpio);
+  }
 
-  const selPull = document.createElement('select');
-  ['up','down','none'].forEach(v => {
-    const o = new Option(v, v);
-    if (b.source && b.source.pull === v) o.selected = true;
-    selPull.appendChild(o);
-  });
-  td(selPull);
+  renderSourceCells();
 
-  const selEdge = document.createElement('select');
-  ['falling','rising','both'].forEach(v => {
-    const o = new Option(v, v);
-    if (b.source && b.source.edge === v) o.selected = true;
-    selEdge.appendChild(o);
-  });
-  td(selEdge);
-
+  // --- Colonne 5 : Debounce ---
   const inpDeb = document.createElement('input');
   inpDeb.type = 'number';
   inpDeb.min = 0;
-  inpDeb.value = (b.source && b.source.debounce_ms != null) ? b.source.debounce_ms : 300;
+  let debValue = 300;
+  if (b.debounce_ms != null) debValue = b.debounce_ms;
+  else if (b.source && b.source.debounce_ms != null) debValue = b.source.debounce_ms;
+  inpDeb.value = debValue;
   td(inpDeb);
 
+  // --- Colonne 6 : Actor ---
   const selActor = document.createElement('select');
   selActor.appendChild(new Option('— choisir —', ''));
   actors.forEach(a => {
@@ -526,8 +914,10 @@ function addRow(b) {
     if (b.action && b.action.actor === a.id) o.selected = true;
     selActor.appendChild(o);
   });
+  selActor.addEventListener('change', refreshActorAvailability);
   td(selActor);
 
+  // --- Colonne 7 : Action ---
   const selDo = document.createElement('select');
   ['on','off','toggle'].forEach(v => {
     const o = new Option(v, v);
@@ -536,19 +926,208 @@ function addRow(b) {
   });
   td(selDo);
 
+  // --- Colonne 8 : Notif ---
   const inpNotif = document.createElement('input');
   inpNotif.type = 'checkbox';
   inpNotif.checked = !!b.notify;
   const tdNotif = td(inpNotif);
   tdNotif.style.textAlign = 'center';
 
+  // --- Colonne 9 : Delete ---
   const btnDel = document.createElement('button');
   btnDel.textContent = '✕';
   btnDel.className = 'danger';
-  btnDel.onclick = () => tr.remove();
+  btnDel.onclick = () => {
+    tr.remove();
+    refreshActorAvailability();
+    refreshGPIOAvailability();
+  };
   td(btnDel);
 
   document.getElementById('rows').appendChild(tr);
+  refreshActorAvailability();
+  refreshGPIOAvailability();
+}
+
+/**
+ * Met à jour les <option> des selects GPIO/PCF pour griser les pins
+ * déjà utilisées par d'autres boutons. Travaille sur :
+ * - selects GPIO direct (.gpio-select) → grise GPIO occupés ailleurs
+ * - selects INT GPIO PCF8574 (.pcf-int) → grise GPIO occupés ailleurs
+ * - selects pin PCF8574 (.pcf-pin)     → grise pins occupées sur même address
+ */
+function refreshGPIOAvailability() {
+  const rows = document.querySelectorAll('#rows tr');
+
+  // Collecter les usages
+  const usedGPIO = {};        // gpio_pin → row_name
+  const usedPcfPin = {};      // "0x21:P3" → row_name
+
+  rows.forEach(tr => {
+    const myName = tr.querySelectorAll('td')[0].querySelector('input').value.trim() || '?';
+    const type = tr.dataset.sourceType;
+    if (type === 'gpio') {
+      const sel = tr.querySelector('.gpio-select');
+      const v = sel && sel.value;
+      if (v !== '' && v != null) usedGPIO[parseInt(v, 10)] = myName;
+    } else if (type === 'pcf8574') {
+      const intSel = tr.querySelector('.pcf-int');
+      const v = intSel && intSel.value;
+      if (v !== '' && v != null) {
+        // L'INT GPIO peut être partagé entre plusieurs boutons sur le même chip
+        // (legitime), donc on ne grise que pour LES AUTRES boutons. On marque
+        // comme partagé.
+        const key = parseInt(v, 10);
+        usedGPIO[key] = usedGPIO[key] ? usedGPIO[key] + ',' + myName : myName;
+      }
+      const addrSel = tr.querySelector('.pcf-addr');
+      const pinSel = tr.querySelector('.pcf-pin');
+      const addr = addrSel && addrSel.value;
+      const pin = pinSel && pinSel.value;
+      if (addr && pin !== '' && pin != null) {
+        usedPcfPin[`${addr}:P${pin}`] = myName;
+      }
+    }
+  });
+
+  // Maintenant pour chaque ligne, update les selects
+  rows.forEach(tr => {
+    const myName = tr.querySelectorAll('td')[0].querySelector('input').value.trim() || '?';
+    const type = tr.dataset.sourceType;
+
+    if (type === 'gpio') {
+      const sel = tr.querySelector('.gpio-select');
+      if (!sel) return;
+      Array.from(sel.options).forEach(opt => {
+        if (!opt.value) return;
+        const g = parseInt(opt.value, 10);
+        let label = `GPIO ${g}`;
+        let disabled = false;
+        // Système (blacklist)
+        if (blacklist.has(g)) {
+          const reasons = blacklistReasons[String(g)] || [];
+          label += reasons.length ? ` (${reasons.join('+')})` : ' (système)';
+          disabled = true;
+        }
+        // Actor output existant
+        else if (busyGPIOs.has(g)) { label += ' (utilisé en sortie)'; disabled = true; }
+        // Utilisé par un autre bouton/INT (on s'exclut)
+        else if (usedGPIO[g] && usedGPIO[g] !== myName) {
+          label += ` (utilisé par ${usedGPIO[g]})`;
+          disabled = true;
+        }
+        opt.textContent = label;
+        opt.disabled = disabled;
+      });
+    } else if (type === 'pcf8574') {
+      // INT GPIO : grise ceux occupés par un GPIO direct ou un autre INT de
+      // PCF différent. Pour le MÊME PCF (même address), l'INT peut être
+      // partagé entre tous les boutons → pas griser.
+      const intSel = tr.querySelector('.pcf-int');
+      const myAddrSel = tr.querySelector('.pcf-addr');
+      const myAddr = myAddrSel && myAddrSel.value;
+      if (intSel) {
+        Array.from(intSel.options).forEach(opt => {
+          if (!opt.value) return;
+          const g = parseInt(opt.value, 10);
+          let label = `GPIO ${g}`;
+          let disabled = false;
+          if (blacklist.has(g)) {
+            const reasons = blacklistReasons[String(g)] || [];
+            label += reasons.length ? ` (${reasons.join('+')})` : ' (système)';
+            disabled = true;
+          } else if (busyGPIOs.has(g)) { label += ' (utilisé en sortie)'; disabled = true; }
+          else {
+            // Vérifier si utilisé par un GPIO direct ailleurs (toujours conflit)
+            // ou par un PCF d'address différente (conflit)
+            let conflictNames = [];
+            rows.forEach(otherTr => {
+              if (otherTr === tr) return;
+              const otherType = otherTr.dataset.sourceType;
+              const otherName = otherTr.querySelectorAll('td')[0].querySelector('input').value.trim() || '?';
+              if (otherType === 'gpio') {
+                const sel = otherTr.querySelector('.gpio-select');
+                if (sel && parseInt(sel.value, 10) === g) conflictNames.push(otherName);
+              } else if (otherType === 'pcf8574') {
+                const oInt = otherTr.querySelector('.pcf-int');
+                const oAddr = otherTr.querySelector('.pcf-addr');
+                if (oInt && parseInt(oInt.value, 10) === g
+                    && oAddr && oAddr.value !== myAddr) {
+                  conflictNames.push(otherName + ' [autre PCF]');
+                }
+              }
+            });
+            if (conflictNames.length > 0) {
+              label += ` (utilisé par ${conflictNames.join(', ')})`;
+              disabled = true;
+            }
+          }
+          opt.textContent = label;
+          opt.disabled = disabled;
+        });
+      }
+      // Pin P0-P7 : grise ceux pris sur la MÊME address
+      const pinSel = tr.querySelector('.pcf-pin');
+      if (pinSel && myAddr) {
+        Array.from(pinSel.options).forEach(opt => {
+          const p = parseInt(opt.value, 10);
+          const key = `${myAddr}:P${p}`;
+          const taker = usedPcfPin[key];
+          if (taker && taker !== myName) {
+            opt.textContent = `P${p} (utilisé par ${taker})`;
+            opt.disabled = true;
+          } else {
+            opt.textContent = `P${p}`;
+            opt.disabled = false;
+          }
+        });
+      }
+    }
+  });
+}
+
+/**
+ * Parcourt toutes les lignes, repère les actor IDs utilisés par 2+ boutons,
+ * et met à jour les labels des <option> dans chaque <select> d'actor pour
+ * indiquer "(déjà utilisé)" sur les options correspondantes.
+ * Non bloquant : l'utilisateur peut quand même choisir le même actor pour
+ * 2 boutons (cas légitime : un bouton ON + un bouton OFF sur le même actor).
+ */
+function refreshActorAvailability() {
+  const rows = document.querySelectorAll('#rows tr');
+  // Compter qui utilise quoi
+  const usage = {};  // actor_id → [row_name, row_name, ...]
+  rows.forEach(tr => {
+    const tds = tr.querySelectorAll('td');
+    const name = tds[0].querySelector('input').value.trim() || '?';
+    // tds[6] = Actor avec la nouvelle structure (Nom, Type, Source, Pull, Edge, Deb, Actor, Action, Notif, Del)
+    const sel = tds[6] && tds[6].querySelector('select');
+    const actor = sel ? sel.value : '';
+    if (actor) {
+      usage[actor] = usage[actor] || [];
+      usage[actor].push(name);
+    }
+  });
+  // Maintenant pour chaque ligne, met à jour le label des options
+  rows.forEach(tr => {
+    const tds = tr.querySelectorAll('td');
+    const sel = tds[6] && tds[6].querySelector('select');
+    if (!sel) return;
+    Array.from(sel.options).forEach(opt => {
+      if (!opt.value) return;
+      const actorObj = actors.find(a => a.id === opt.value);
+      if (!actorObj) return;
+      const myName = tds[0].querySelector('input').value.trim() || '?';
+      const others = (usage[opt.value] || []).filter(n => n !== myName);
+      if (others.length > 0) {
+        opt.textContent = `${actorObj.name} (déjà utilisé par ${others.join(', ')})`;
+        opt.style.color = '#c80';
+      } else {
+        opt.textContent = actorObj.name;
+        opt.style.color = '';
+      }
+    });
+  });
 }
 
 function readRows() {
@@ -556,17 +1135,40 @@ function readRows() {
   document.querySelectorAll('#rows tr').forEach(tr => {
     const tds = tr.querySelectorAll('td');
     const name = tds[0].querySelector('input').value.trim();
-    const pinRaw = tds[1].querySelector('select').value;
-    const pull = tds[2].querySelector('select').value;
-    const edge = tds[3].querySelector('select').value;
-    const deb = parseInt(tds[4].querySelector('input').value, 10);
-    const actor = tds[5].querySelector('select').value;
-    const doVal = tds[6].querySelector('select').value;
-    const notify = tds[7].querySelector('input').checked;
-    if (!name || !pinRaw || !actor) return;
+    const type = tr.dataset.sourceType || 'gpio';
+    const deb = parseInt(tds[5].querySelector('input').value, 10);
+    const actor = tds[6].querySelector('select').value;
+    const doVal = tds[7].querySelector('select').value;
+    const notify = tds[8].querySelector('input').checked;
+
+    if (!name || !actor) return;
+
+    let source;
+    if (type === 'gpio') {
+      const pinRaw = tr.querySelector('.gpio-select').value;
+      const pull = tds[3].querySelector('select').value;
+      const edge = tds[4].querySelector('select').value;
+      if (!pinRaw) return;  // ligne incomplète
+      source = {type: 'gpio', pin: parseInt(pinRaw, 10), pull, edge};
+    } else if (type === 'pcf8574') {
+      const addr = tr.querySelector('.pcf-addr').value;
+      const intRaw = tr.querySelector('.pcf-int').value;
+      const pinRaw = tr.querySelector('.pcf-pin').value;
+      if (!addr || !intRaw || pinRaw === '' || pinRaw == null) return;
+      source = {
+        type: 'pcf8574',
+        address: addr,
+        int_gpio: parseInt(intRaw, 10),
+        pin: parseInt(pinRaw, 10),
+      };
+    } else {
+      return;
+    }
+
     out.push({
       name,
-      source: {type: 'gpio', pin: parseInt(pinRaw, 10), pull, edge, debounce_ms: deb},
+      source,
+      debounce_ms: deb,
       action: {actor, do: doVal},
       notify,
     });
@@ -652,6 +1254,7 @@ class InputControl(CBPiExtension):
     def __init__(self, cbpi):
         self.cbpi = cbpi
         self.sources = []
+        self.mux_registry: dict = {}  # PCF8574 muxers : (addr, int_gpio, bus) → mux
         self.last_load_errors = []
         # Détection des bus système actifs au boot (figée pour la durée de
         # vie du plugin ; un changement de config.txt → reboot CBPi pour
@@ -739,18 +1342,22 @@ class InputControl(CBPiExtension):
         loop = asyncio.get_event_loop()
         errors = []
         new_sources = []
-        used_pins = set()
+        used_pins = set()              # GPIO pins direct utilisés
+        used_int_gpios = set()         # GPIO utilisés comme INT pour PCF8574
+        used_pcf_pins = set()          # (address, pin) déjà alloués
         busy_output = self._busy_output_gpios()
+        new_mux_registry: dict = {}    # (address, int_gpio, bus) → mux
 
         for idx, btn in enumerate(buttons):
             try:
-                self._validate_button(btn, used_pins, busy_output)
+                self._validate_button(btn, used_pins, busy_output,
+                                      used_int_gpios, used_pcf_pins)
             except ValueError as e:
                 err = f"#{idx} ({btn.get('name','?')}) ignoré : {e}"
                 logger.error(err)
                 errors.append(err)
                 continue
-            source = build_source(btn, self._handle_press, loop)
+            source = build_source(btn, self._handle_press, loop, new_mux_registry)
             if source is None:
                 errors.append(f"#{idx} : build_source a échoué")
                 continue
@@ -762,9 +1369,27 @@ class InputControl(CBPiExtension):
                 logger.error(err)
                 errors.append(err)
 
+        # Maintenant que toutes les PCF8574InputSource ont enregistré leurs
+        # pins auprès des multiplexers, on démarre les multiplexers (ouvre
+        # I2C, arme INT GPIO). Un mux qui échoue invalide tous ses boutons.
+        for key, mux in list(new_mux_registry.items()):
+            try:
+                await mux.start(loop)
+            except Exception as e:
+                err = f"PCF8574 @0x{mux.address:02x} INT=GPIO{mux.int_gpio} start KO: {e}"
+                logger.error(err)
+                errors.append(err)
+                # Retire les sources qui dépendaient de ce mux
+                new_sources = [s for s in new_sources
+                               if not (isinstance(s, PCF8574InputSource)
+                                       and s.address == mux.address
+                                       and s.int_gpio == mux.int_gpio
+                                       and s.i2c_bus == mux.i2c_bus)]
+                new_mux_registry.pop(key, None)
+
         self.sources = new_sources
+        self.mux_registry = new_mux_registry
         self.last_load_errors = errors
-        # WARNING level → visible même sans -d 20, rare donc pas spam
         if errors:
             logger.warning("InputControl reload : %d source(s) ✓  %d erreur(s) ✗",
                            len(self.sources), len(errors))
@@ -775,7 +1400,12 @@ class InputControl(CBPiExtension):
                            len(self.sources))
         return {"loaded": len(self.sources), "errors": errors}
 
-    def _validate_button(self, btn, used_pins, busy_output):
+    def _validate_button(self, btn, used_pins, busy_output,
+                         used_int_gpios=None, used_pcf_pins=None):
+        if used_int_gpios is None:
+            used_int_gpios = set()
+        if used_pcf_pins is None:
+            used_pcf_pins = set()
         if not isinstance(btn, dict):
             raise ValueError("doit être un objet JSON")
         name = btn.get("name")
@@ -792,7 +1422,6 @@ class InputControl(CBPiExtension):
             if not isinstance(pin, int):
                 raise ValueError("source.pin doit être un entier")
             if pin in self.gpio_blacklist:
-                # Donne plus d'info : pour quel bus est-il bloqué ?
                 bus_reason = []
                 for bus, pins in _BUS_PINS.items():
                     if pin in pins and self.active_buses.get(bus):
@@ -803,7 +1432,52 @@ class InputControl(CBPiExtension):
                 raise ValueError(f"GPIO {pin} déjà utilisé par un actor output")
             if pin in used_pins:
                 raise ValueError(f"GPIO {pin} déjà utilisé par un autre bouton")
+            if pin in used_int_gpios:
+                raise ValueError(f"GPIO {pin} déjà utilisé comme INT PCF8574")
             used_pins.add(pin)
+        elif src_type == "pcf8574":
+            # I2C must be active
+            if not self.active_buses.get("i2c"):
+                raise ValueError(
+                    "I2C non activé sur ce Pi — "
+                    "ajoute 'dtparam=i2c_arm=on' dans /boot/firmware/config.txt"
+                )
+            # address
+            addr_raw = src.get("address")
+            if addr_raw is None:
+                raise ValueError("source.address manquant")
+            try:
+                addr = int(addr_raw, 16) if (isinstance(addr_raw, str)
+                                             and addr_raw.startswith("0x")) \
+                    else int(addr_raw)
+            except (ValueError, TypeError):
+                raise ValueError(f"source.address '{addr_raw}' invalide")
+            if addr not in PCF8574Multiplexer.VALID_ADDRESSES:
+                raise ValueError(
+                    f"address 0x{addr:02x} hors plage PCF8574 "
+                    f"(0x20-0x27 ou PCF8574A 0x38-0x3F)"
+                )
+            # int_gpio
+            int_gpio = src.get("int_gpio")
+            if not isinstance(int_gpio, int):
+                raise ValueError("source.int_gpio doit être un entier")
+            if int_gpio in self.gpio_blacklist:
+                raise ValueError(f"GPIO {int_gpio} (INT) réservé système")
+            if int_gpio in busy_output:
+                raise ValueError(f"GPIO {int_gpio} (INT) utilisé par actor output")
+            if int_gpio in used_pins:
+                raise ValueError(f"GPIO {int_gpio} (INT) déjà utilisé comme bouton GPIO")
+            used_int_gpios.add(int_gpio)
+            # pin P0-P7
+            pin = src.get("pin")
+            if not isinstance(pin, int) or not (0 <= pin <= 7):
+                raise ValueError("source.pin doit être un entier 0-7 (P0-P7)")
+            key = (addr, pin)
+            if key in used_pcf_pins:
+                raise ValueError(
+                    f"PCF8574 @0x{addr:02x} P{pin} déjà utilisé par un autre bouton"
+                )
+            used_pcf_pins.add(key)
         action = btn.get("action")
         if not isinstance(action, dict):
             raise ValueError("'action' manquant")
@@ -822,22 +1496,86 @@ class InputControl(CBPiExtension):
         if actor_id is None:
             logger.error("[%s] actor '%s' introuvable", name, actor_ref)
             return
+        # Résolution nom lisible (pour notif + log). Fallback sur actor_ref
+        # (qui peut être un id ou déjà un nom selon la config user).
+        actor_name = self._get_actor_name(actor_id) or actor_ref
         try:
             if do == "on":
                 await self.cbpi.actor.on(actor_id)
             elif do == "off":
                 await self.cbpi.actor.off(actor_id)
             elif do == "toggle":
-                await self.cbpi.actor.toogle(actor_id)  # typo officielle cbpi
-            logger.info("[%s] %s sur '%s' OK", name, do, actor_ref)
+                # NB : cbpi.actor.toogle() est buggé pour beaucoup d'actor
+                # types (la méthode instance.toggle() n'est pas implémentée
+                # sur CBPiActor de base, ni sur MQTTActor, etc). L'exception
+                # est avalée silencieusement → no-op.
+                # On fait le toggle nous-même en lisant l'état courant.
+                current_state = self._get_actor_state(actor_id)
+                if current_state:
+                    await self.cbpi.actor.off(actor_id)
+                else:
+                    await self.cbpi.actor.on(actor_id)
+                logger.info("[%s] toggle (état %s → %s) sur '%s' OK",
+                            name, current_state, not current_state, actor_name)
+            else:
+                logger.info("[%s] %s sur '%s' OK", name, do, actor_name)
             if notify:
                 try:
                     self.cbpi.notify("InputControl",
-                                     f"Bouton '{name}' → {do} sur '{actor_ref}'")
+                                     f"Bouton '{name}' → {do} sur '{actor_name}'")
                 except Exception:
                     pass
         except Exception as e:
-            logger.error("[%s] %s sur '%s' KO: %s", name, do, actor_ref, e)
+            logger.error("[%s] %s sur '%s' KO: %s", name, do, actor_name, e)
+
+    def _get_actor_name(self, actor_id) -> Optional[str]:
+        """Retourne le nom lisible d'un actor par son id, ou None si introuvable."""
+        try:
+            item = self.cbpi.actor.find_by_id(actor_id)
+            if item is None:
+                return None
+            n = getattr(item, "name", None)
+            if n:
+                return n
+            if isinstance(item, dict):
+                return item.get("name")
+        except Exception:
+            pass
+        return None
+
+    def _get_actor_state(self, actor_id) -> bool:
+        """
+        Lit l'état (on/off) d'un actor par son id.
+
+        Note CBPi : le dataclass Actor a un attribut `state` mais qui n'est
+        PAS mis à jour automatiquement (reste à False par défaut). Le vrai
+        état est sur `item.instance.state`. C'est ce que fait `to_dict()` :
+        il appelle `self.instance.get_state()` à chaque sérialisation.
+        """
+        try:
+            item = self.cbpi.actor.find_by_id(actor_id)
+            if item is None:
+                return False
+            # Cas standard : Actor dataclass avec .instance
+            instance = getattr(item, "instance", None)
+            if instance is not None:
+                # Préférer get_state() qui est l'API publique, fallback sur .state
+                if hasattr(instance, "get_state"):
+                    state_dict = instance.get_state()
+                    if isinstance(state_dict, dict) and "state" in state_dict:
+                        return bool(state_dict["state"])
+                if hasattr(instance, "state"):
+                    return bool(instance.state)
+            # Cas dict (versions plus anciennes ou exotiques de CBPi)
+            if isinstance(item, dict):
+                if "instance" in item and item["instance"] is not None:
+                    return bool(getattr(item["instance"], "state", False))
+                return bool(item.get("state", False))
+            # Fallback : .state direct sur l'item
+            return bool(getattr(item, "state", False))
+        except Exception as e:
+            logger.warning("Lecture état actor '%s' KO: %s", actor_id, e)
+            return False
 
     def _resolve_actor_id(self, ref):
         if not ref:
@@ -856,12 +1594,20 @@ class InputControl(CBPiExtension):
         return None
 
     async def _stop_all_sources(self):
+        # Sources d'abord, mux ensuite (les sources se désenregistrent juste,
+        # le mux ferme l'I2C et libère le GPIO INT)
         for s in self.sources:
             try:
                 await s.stop()
             except Exception as e:
                 logger.warning("Stop %s KO: %s", s.name, e)
         self.sources = []
+        for key, mux in list(self.mux_registry.items()):
+            try:
+                await mux.stop()
+            except Exception as e:
+                logger.warning("Stop mux @0x%02x KO: %s", mux.address, e)
+        self.mux_registry = {}
 
     # --------------------------- Routes HTTP --------------------------- #
 
@@ -879,6 +1625,7 @@ class InputControl(CBPiExtension):
         return web.json_response({
             "active_sources": len(self.sources),
             "sources": [s.describe() for s in self.sources],
+            "pcf8574_muxers": [m.describe() for m in self.mux_registry.values()],
             "last_load_errors": self.last_load_errors,
             "running_on_pi": _ON_PI,
             "gpio_backend": _GPIO_BACKEND,
